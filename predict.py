@@ -26,9 +26,8 @@ class Predictor(BasePredictor):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         log(f"Using device: {self.device}")
 
-        # 1. Carica Processor e Model specifici per il TRACKER
-        # Nota: Usiamo Sam3TrackerProcessor e Sam3TrackerModel
-        repo_id = "Davidinos/sam3data" # O il tuo path locale se preferisci
+        # Repository HuggingFace o Path Locale
+        repo_id = "Davidinos/sam3data" 
         
         log(f"Caricamento Tracker Processor da {repo_id}...")
         self.processor = Sam3TrackerProcessor.from_pretrained(repo_id)
@@ -41,53 +40,61 @@ class Predictor(BasePredictor):
     def predict(
         self,
         image: Path = Input(description="Immagine da analizzare"),
-        positive_points: str = Input(
-            description="Lista JSON di punti positivi (da includere). Es: [[500, 300], [550, 320]]", 
-            default="[]"
-        ),
-        negative_points: str = Input(
-            description="Lista JSON di punti negativi (da escludere/sfondo). Es: [[100, 100]]", 
-            default="[]"
-        ),
-    ) -> Path:
-        """Esegue il raffinamento della maschera basato su punti"""
-        log(f"--- Nuova Richiesta Tracker ---")
         
-        # Gestione Output Dir
-        output_dir = Path("/tmp/mask_result")
+        # ESEMPIO INPUT: [[[15,14],[16,17]], [[11,10]]]
+        # Lista esterna = Oggetti. Lista interna = Punti per quell'oggetto.
+        objects_points: str = Input(
+            description="JSON Lista di Liste di punti. Ogni lista interna è un oggetto. Es: [[[x1,y1],[x2,y2]], [[x3,y3]]]", 
+            default="[[[500, 300]]]"
+        ),
+        
+        # ESEMPIO LABELS: [[1, 0], [1]]
+        # Deve corrispondere alla struttura dei punti. 1=Positivo, 0=Negativo
+        objects_labels: str = Input(
+            description="JSON Lista di Liste di labels (1=Pos, 0=Neg). Deve specchiare la struttura di objects_points.", 
+            default="[[1]]"
+        ),
+    ) -> List[Path]:
+        """
+        Esegue il raffinamento per MULTIPLI oggetti contemporaneamente sulla stessa immagine.
+        Restituisce una lista di percorsi alle maschere generate.
+        """
+        log(f"--- Nuova Richiesta Multi-Oggetto ---")
+        
+        # 1. Gestione Cartella Output
+        output_dir = Path("/tmp/mask_results")
         if output_dir.exists():
             shutil.rmtree(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. Caricamento Immagine
+        # 2. Caricamento Immagine
         log(f"Caricamento immagine: {image}")
         pil_image = Image.open(image).convert("RGB")
-        width, height = pil_image.size
-        log(f"Dimensioni: {width}x{height}")
+        log(f"Dimensioni: {pil_image.size}")
 
-        # 2. Parsing dei Punti (String -> List)
+        # 3. Parsing JSON Inputs
         try:
-            pos_pts = json.loads(positive_points)
-            neg_pts = json.loads(negative_points)
+            # points_data sarà: List[List[List[int]]] -> [ [ [x,y], [x,y] ], [ [x,y] ] ]
+            points_data = json.loads(objects_points)
+            # labels_data sarà: List[List[int]]       -> [ [1, 0], [1] ]
+            labels_data = json.loads(objects_labels)
         except json.JSONDecodeError:
-            raise ValueError("Errore nel formato dei punti. Usa formato JSON valido es: [[x,y], [x,y]]")
+            raise ValueError("Errore JSON nei punti o labels. Controlla la formattazione.")
 
-        # Uniamo punti e labels
-        all_points = pos_pts + neg_pts
-        all_labels = [1] * len(pos_pts) + [0] * len(neg_pts)
+        # Validazione base
+        if len(points_data) != len(labels_data):
+            raise ValueError(f"Mismatch: Hai passato punti per {len(points_data)} oggetti ma labels per {len(labels_data)} oggetti.")
+        
+        num_objects = len(points_data)
+        log(f"Rilevati {num_objects} oggetti da processare.")
 
-        if len(all_points) == 0:
-            raise ValueError("Devi fornire almeno un punto positivo o negativo.")
+        # 4. Formattazione per SAM 3 (Nesting 4D)
+        # La struttura richiesta è: [ Batch_Images [ List_Objects [ List_Points [x,y] ] ] ]
+        # Dato che abbiamo 1 sola immagine, avvolgiamo tutto in una lista esterna.
+        fmt_points = [points_data] 
+        fmt_labels = [labels_data]
 
-        log(f"Punti totali: {len(all_points)} (Pos: {len(pos_pts)}, Neg: {len(neg_pts)})")
-
-        # 3. Formattazione per SAM 3 (Nesting 4D richiesto)
-        # Shape Points: (Batch, Num_Objects, Num_Points, 2) -> (1, 1, N, 2)
-        # Shape Labels: (Batch, Num_Objects, Num_Points)    -> (1, 1, N)
-        fmt_points = [[all_points]] 
-        fmt_labels = [[all_labels]]
-
-        # 4. Esecuzione Inferenza
+        # 5. Inferenza
         log("Esecuzione SAM3 Tracker Inference...")
         start_inf = time.time()
         
@@ -103,34 +110,46 @@ class Predictor(BasePredictor):
         
         log(f"Inferenza completata in {time.time() - start_inf:.2f}s")
 
-        # 5. Selezione Maschera Migliore (Logica IoU Score)
-        # outputs.iou_scores ha shape (Batch=1, Num_Obj=1, 3)
-        scores = outputs.iou_scores
-        best_mask_idx = torch.argmax(scores, dim=-1)
-        best_idx_val = best_mask_idx[0, 0].item() # Estraiamo l'intero (0, 1 o 2)
-        
-        log(f"Selezionata maschera con indice {best_idx_val} (basato su IoU score)")
-
         # 6. Post-processing
-        all_masks = self.processor.post_process_masks(
+        # Restituisce: [Batch_Size, Num_Objects, 3, H, W] -> Qui Batch=1
+        all_masks_batch = self.processor.post_process_masks(
             outputs.pred_masks.cpu(), 
             inputs["original_sizes"], 
             mask_threshold=0.0, 
             binarize=True
-        )[0] # Prende Batch 0 -> Shape: (Num_Obj=1, 3, H, W)
-
-        # Seleziona l'Oggetto 0 e la variante Maschera vincente
-        final_mask = all_masks[0, best_idx_val] # Shape (H, W)
-
-        # 7. Salvataggio
-        log("Salvataggio risultato...")
-        # Convertiamo Tensor Bool -> Numpy Bool -> Uint8 (0-255)
-        mask_np = final_mask.cpu().numpy()
-        mask_uint8 = (mask_np * 255).astype(np.uint8)
+        )
         
-        mask_pil = Image.fromarray(mask_uint8, mode="L")
-        output_path = output_dir / "refined_mask.png"
-        mask_pil.save(output_path)
+        # Prendiamo la prima (e unica) immagine del batch
+        # shape risultante: (Num_Objects, 3, H, W)
+        object_masks = all_masks_batch[0] 
         
-        log(f"Maschera salvata in {output_path}")
-        return output_path
+        # Recuperiamo gli scores: shape (1, Num_Objects, 3)
+        iou_scores = outputs.iou_scores[0] # Ora shape (Num_Objects, 3)
+
+        output_paths = []
+
+        # 7. Ciclo su ogni oggetto per scegliere la maschera migliore e salvarla
+        log(f"Salvataggio di {num_objects} maschere...")
+        
+        for i in range(num_objects):
+            # A. Trova l'indice (0,1,2) migliore per l'oggetto corrente 'i'
+            scores_obj = iou_scores[i]            # shape (3,)
+            best_idx = torch.argmax(scores_obj).item()
+            
+            # B. Estrai la maschera vincente
+            # object_masks ha shape (Num_Objects, 3, H, W)
+            final_mask = object_masks[i, best_idx] # shape (H, W)
+
+            # C. Salvataggio
+            mask_np = final_mask.cpu().numpy()
+            mask_uint8 = (mask_np * 255).astype(np.uint8)
+            mask_pil = Image.fromarray(mask_uint8, mode="L")
+            
+            filename = f"mask_obj_{i:02d}.png"
+            file_path = output_dir / filename
+            mask_pil.save(file_path)
+            
+            output_paths.append(file_path)
+            log(f" -> Oggetto {i}: salvato {filename} (Score idx: {best_idx})")
+
+        return output_paths
